@@ -41,7 +41,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # Users table
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -57,7 +56,6 @@ def init_db():
         )
     ''')
     
-    # Referrals table
     c.execute('''
         CREATE TABLE IF NOT EXISTS referrals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,7 +66,6 @@ def init_db():
         )
     ''')
     
-    # Logs table
     c.execute('''
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,7 +76,6 @@ def init_db():
         )
     ''')
     
-    # Settings table - for referral requirement
     c.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -87,10 +83,8 @@ def init_db():
         )
     ''')
     
-    # Set default referral requirement to 2
     c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('referral_required', '2'))
     
-    # Grant admin rights to ADMIN_IDS
     for admin_id in ADMIN_IDS:
         c.execute('''
             INSERT OR REPLACE INTO users (user_id, username, is_admin, verified, joined_date)
@@ -100,9 +94,6 @@ def init_db():
     conn.commit()
     conn.close()
     logger.info(f"Database initialized at: {DB_PATH}")
-    logger.info(f"Admins: {ADMIN_IDS}")
-
-# ============ DATABASE FUNCTIONS ============
 
 def get_user(user_id):
     conn = sqlite3.connect(DB_PATH)
@@ -115,10 +106,8 @@ def get_user(user_id):
 def add_user(user_id, username, referral_code, referred_by=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    
     is_admin = 1 if user_id in ADMIN_IDS else 0
     verified = 1 if is_admin else 0
-    
     c.execute('''
         INSERT OR IGNORE INTO users (user_id, username, referral_code, referred_by, joined_date, is_admin, verified)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -211,7 +200,7 @@ def get_referral_requirement():
     conn.close()
     if result:
         return int(result[0])
-    return 2  # Default
+    return 2
 
 def set_referral_requirement(value):
     conn = sqlite3.connect(DB_PATH)
@@ -313,7 +302,6 @@ def get_bot_username():
         return "lenskartremixbot"
 
 def is_user_eligible(user_id):
-    """Check if user can access the bot"""
     user = get_user_status(user_id)
     if not user:
         return False
@@ -321,30 +309,11 @@ def is_user_eligible(user_id):
         return True
     if user['is_banned']:
         return False
-    
     req = get_referral_requirement()
-    if req == 0:  # Referral system OFF
+    if req == 0:
         return True
     referrals = get_referrals(user_id)
     return referrals >= req
-
-def get_eligibility_message(user_id):
-    """Get message explaining why user can't access"""
-    user = get_user_status(user_id)
-    if not user:
-        return "❌ User not found."
-    if user['is_banned']:
-        return "🚫 You are banned."
-    if user['is_admin']:
-        return "👑 Admin access granted."
-    
-    req = get_referral_requirement()
-    if req == 0:
-        return "✅ Access granted!"
-    referrals = get_referrals(user_id)
-    if referrals >= req:
-        return "✅ Access granted!"
-    return f"🔒 Need {req} referrals. You have {referrals}."
 
 # ============ COMMANDS ============
 
@@ -409,7 +378,6 @@ def show_main_menu(user_id):
     
     admin_badge = "👑 Admin" if user['is_admin'] else ""
     
-    # Status message
     if user['is_admin']:
         status_text = "👑 **Admin Access** - Full Control"
     elif req == 0:
@@ -457,7 +425,6 @@ def handle_callbacks(call):
     user_id = call.from_user.id
     data = call.data
     
-    # Skip channel check for admins
     if not is_admin(user_id) and data != "check_membership" and CHANNEL_ID and not check_channel_membership(user_id):
         markup = InlineKeyboardMarkup()
         channel_username = CHANNEL_ID.replace('-100', '')
@@ -536,7 +503,7 @@ def handle_callbacks(call):
         if req > 0:
             text += f"Share with friends! Need {req} referrals to unlock."
         else:
-            text += f"Referral system is OFF. Everyone has access!"
+            text += "Referral system is OFF. Everyone has access!"
         bot.edit_message_text(text,
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
@@ -595,7 +562,6 @@ def handle_callbacks(call):
     elif data == "back_to_menu":
         show_main_menu(user_id)
     
-    # Admin panel callbacks
     elif data.startswith("admin_"):
         if not is_admin(user_id):
             bot.answer_callback_query(call.id, "⛔ Admin only!")
@@ -711,7 +677,6 @@ def process_otp_input(message):
 def show_admin_panel(message, admin_id):
     stats = get_statistics()
     req = get_referral_requirement()
-    
     req_status = "OFF" if req == 0 else str(req)
     
     text = f"""
@@ -926,10 +891,51 @@ def process_unverify_user(message):
 
 def process_broadcast(message):
     admin_id = message.from_user.id
-    text = message.text
+    broadcast_text = message.text
     
     users = get_all_users()
     sent = 0
-    for u in users:
+    for user in users:
         try:
-            bot.send_message(u
+            bot.send_message(user[0], f"📢 {broadcast_text}")
+            sent += 1
+            time.sleep(0.05)
+        except:
+            pass
+    
+    bot.send_message(admin_id, f"✅ Broadcast sent to {sent} users.")
+    log_action(admin_id, "broadcast", f"Sent to {sent} users")
+
+# ============ FLASK WEBHOOK ============
+
+try:
+    from flask import Flask, request, jsonify
+except ImportError:
+    logger.error("Flask not installed!")
+    sys.exit(1)
+
+app = Flask(__name__)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        json_str = request.get_data().decode('UTF-8')
+        update = telebot.types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+        return 'OK', 200
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return 'Error', 500
+
+@app.route('/health')
+def health():
+    try:
+        stats = get_statistics()
+        req = get_referral_requirement()
+        return jsonify({
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "users": stats['total'],
+            "verified": stats['verified'],
+            "referral_requirement": req
+       
