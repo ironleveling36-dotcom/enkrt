@@ -33,7 +33,7 @@ class LenskartFakeDevice:
         self.phone = phone
         self.phone_code = phone_code
         
-        # 🔥 Generate random device
+        # Generate random device
         self.brand = random.choice(BRANDS)
         self.model = random.choice(MODELS.get(self.brand, ["RMX3031"]))
         self.android_version = random.choice(ANDROID_VERSIONS)
@@ -48,8 +48,9 @@ class LenskartFakeDevice:
         self.customer_type = "EXISTING"
         self.s = requests.Session()
         
-        # 🔥 Generate x-assertion from device data
+        # Generate x-assertion from device data
         self.x_assertion = self.generate_x_assertion()
+        self.last_response = None
         
     def generate_udid(self):
         return uuid.uuid4().hex[:16]
@@ -67,7 +68,7 @@ class LenskartFakeDevice:
         
         return assertion[:100]
         
-    def base_headers(self, extra: dict | None = None) -> dict:
+    def base_headers(self, extra: dict = None) -> dict:
         h = {
             "Content-Type": "application/json; charset=UTF-8",
             "api_key": "valyoo123",
@@ -109,74 +110,81 @@ class LenskartFakeDevice:
         url = f"{BASE}{path}"
         if params:
             url += "?" + "&".join([f"{k}={v}" for k, v in params.items()])
-        r = self.s.post(url, headers=headers, json=body, timeout=30)
-        return r
+        try:
+            r = self.s.post(url, headers=headers, json=body, timeout=30)
+            self.last_response = r
+            return r
+        except Exception as e:
+            self.last_response = None
+            raise e
 
     def get(self, path, params=None):
         headers = self.base_headers()
         url = f"{BASE}{path}"
         if params:
             url += "?" + "&".join([f"{k}={v}" for k, v in params.items()])
-        r = self.s.get(url, headers=headers, timeout=30)
-        return r
+        try:
+            r = self.s.get(url, headers=headers, timeout=30)
+            self.last_response = r
+            return r
+        except Exception as e:
+            self.last_response = None
+            raise e
 
     def create_session(self):
-        print("[1/5] Creating session...")
-        r = self.post("/v2/sessions", {})
-        if r.status_code == 200:
-            data = r.json()
-            self.session_token = data.get("result", {}).get("id")
-            print(f"    ✅ Session: {self.session_token[:20]}...")
-            return True
-        print(f"    ❌ Failed: {r.status_code}")
-        return False
+        try:
+            r = self.post("/v2/sessions", {})
+            if r.status_code == 200:
+                data = r.json()
+                self.session_token = data.get("result", {}).get("id")
+                return True
+            return False
+        except:
+            return False
 
     def send_otp(self):
         if not self.session_token:
             return None
-        print("[2/5] Sending OTP...")
-        body = {"phoneCode": self.phone_code, "telephone": self.phone}
-        r = self.post("/v3/customers/sendOtp", body)
-        if r.status_code == 200:
-            data = r.json()
-            res = data.get("result") or {}
-            self.customer_type = "NEW" if res.get("isNewUser") else "EXISTING"
-            print(f"    ✅ OTP sent! New user: {res.get('isNewUser')}")
-            return res
-        print(f"    ❌ Failed: {r.status_code}")
-        return None
+        try:
+            body = {"phoneCode": self.phone_code, "telephone": self.phone}
+            r = self.post("/v3/customers/sendOtp", body)
+            if r.status_code == 200:
+                data = r.json()
+                res = data.get("result") or {}
+                self.customer_type = "NEW" if res.get("isNewUser") else "EXISTING"
+                return res
+            return None
+        except:
+            return None
 
     def verify_otp(self, code: str):
-        print("[3/5] Verifying OTP...")
-        body = {"code": code, "phoneCode": self.phone_code, "telephone": self.phone}
-        r = self.post("/v2/customers/authenticate/mobile", body)
-        if r.status_code == 200:
-            data = r.json()
-            res = data.get("result") or {}
-            self.auth_token = res.get("token")
-            self.user_id = res.get("user_id")
-            
-            if self.auth_token:
-                self.session_token = self.auth_token
-                print(f"    ✅ OTP verified! User ID: {self.user_id}")
-                print(f"    🔑 x-assertion: {self.x_assertion[:30]}...")
-                return res
-        print(f"    ❌ Failed: {r.status_code}")
-        return None
+        try:
+            body = {"code": code, "phoneCode": self.phone_code, "telephone": self.phone}
+            r = self.post("/v2/customers/authenticate/mobile", body)
+            if r.status_code == 200:
+                data = r.json()
+                res = data.get("result") or {}
+                self.auth_token = res.get("token")
+                self.user_id = res.get("user_id")
+                
+                if self.auth_token:
+                    self.session_token = self.auth_token
+                    return res
+            return None
+        except:
+            return None
 
     def me(self):
-        print("[4/5] Getting profile...")
-        r = self.get("/v2/customers/me")
-        if r.status_code == 200:
-            data = r.json()
-            result = data.get("result", {})
-            self.user_id = result.get("id")
-            print(f"    ✅ User ID: {self.user_id}")
-            print(f"    📱 Device: {self.brand} {self.model}")
-            print(f"    🆔 UDID: {self.udid}")
-            return data
-        print(f"    ❌ Failed: {r.status_code}")
-        return None
+        try:
+            r = self.get("/v2/customers/me")
+            if r.status_code == 200:
+                data = r.json()
+                result = data.get("result", {})
+                self.user_id = result.get("id")
+                return data
+            return None
+        except:
+            return None
 
     def build_steps_payload(self, steps: int = 30000):
         DAY_MS = 86400000
@@ -200,66 +208,58 @@ class LenskartFakeDevice:
         return payload
 
     def claim_reward(self, steps: int = 30000):
-        print(f"\n[5/5] Claiming reward with {steps} steps...")
-        
-        body = self.build_steps_payload(steps)
-        params = {"campaignName": "run-for-frame"}
-        
-        print("    📊 Steps data (7 days):")
-        for i, entry in enumerate(body):
-            dt = datetime.fromtimestamp(entry["timestamp"] / 1000)
-            print(f"      Day {i+1} ({dt.strftime('%d %b')}): {entry['steps']} steps")
-        
-        print(f"\n    🔑 Device:")
-        print(f"      Brand: {self.brand}")
-        print(f"      Model: {self.model}")
-        print(f"      UDID: {self.udid}")
-        print(f"      x-assertion: {self.x_assertion[:30]}...")
-        
-        r = self.post("/v2/customers/bff/campaign/eligibility", body, params)
-        print(f"\n    📥 Status: {r.status_code}")
-        
         try:
-            data = r.json()
-        except:
-            data = {"raw": r.text[:500]}
-        
-        if r.status_code == 200:
-            res = data.get("result") or {}
-            if res.get("giftVoucher"):
-                print("\n" + "="*60)
-                print(f"🎉 REWARD UNLOCKED for {self.phone}!")
-                print("="*60)
-                print(f"   🏆 Tier: {res.get('tier')}")
-                print(f"   🎫 Voucher: {res.get('giftVoucher')}")
-                print(f"   📊 Steps: {res.get('steps')}")
-                if res.get('giftVoucherExpiryDate'):
-                    exp = res.get('giftVoucherExpiryDate')
-                    exp_dt = datetime.fromtimestamp(exp / 1000)
-                    print(f"   ⏰ Expiry: {exp_dt.strftime('%d %b %Y')}")
-                print("="*60)
-                
-                filename = f"reward_{self.phone}.json"
-                with open(filename, "w") as f:
-                    json.dump(data, f, indent=2)
-                print(f"💾 Saved to {filename}")
-                return res
+            body = self.build_steps_payload(steps)
+            params = {"campaignName": "run-for-frame"}
+            
+            r = self.post("/v2/customers/bff/campaign/eligibility", body, params)
+            
+            try:
+                data = r.json()
+            except:
+                data = {"raw": r.text[:500]}
+            
+            if r.status_code == 200:
+                res = data.get("result") or {}
+                if res.get("giftVoucher"):
+                    # Save reward to file
+                    filename = f"reward_{self.phone}.json"
+                    with open(filename, "w") as f:
+                        json.dump(data, f, indent=2)
+                    return {
+                        "success": True,
+                        "tier": res.get("tier"),
+                        "giftVoucher": res.get("giftVoucher"),
+                        "steps": res.get("steps"),
+                        "expiry": res.get("giftVoucherExpiryDate"),
+                        "message": res.get("message", "Reward claimed successfully!")
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "message": res.get("message", "No reward available"),
+                        "code": r.status_code
+                    }
             else:
-                print(f"\n⚠️ {res.get('message', 'Reward not unlocked')}")
-                return res
-        else:
-            print(f"\n❌ Error: {r.status_code}")
-            print(f"Response: {r.text[:500]}")
-            return None
+                return {
+                    "success": False,
+                    "message": f"API Error: {r.status_code}",
+                    "response": data
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Exception: {str(e)}"
+            }
 
     def check_vouchers(self):
-        print("\n📋 Checking vouchers...")
-        r = self.get("/v2/customers/me/giftVoucher", params={"campaignName": "run-for-frame"})
-        if r.status_code == 200:
-            data = r.json()
-            print(json.dumps(data, indent=2, ensure_ascii=False))
-            return data
-        return None
+        try:
+            r = self.get("/v2/customers/me/giftVoucher", params={"campaignName": "run-for-frame"})
+            if r.status_code == 200:
+                return r.json()
+            return None
+        except:
+            return None
 
 
 def main():
@@ -301,15 +301,30 @@ def main():
             continue
         
         device.me()
-        device.claim_reward(steps=30000)
-        device.check_vouchers()
+        result = device.claim_reward(steps=30000)
         
-        results.append({
-            "phone": phone,
-            "status": "✅ Done",
-            "user_id": device.user_id,
-            "device": f"{device.brand} {device.model}"
-        })
+        if result.get("success"):
+            print(f"\n🎉 REWARD UNLOCKED for {phone}!")
+            print(f"   🏆 Tier: {result.get('tier')}")
+            print(f"   🎫 Voucher: {result.get('giftVoucher')}")
+            print(f"   📊 Steps: {result.get('steps')}")
+            results.append({
+                "phone": phone,
+                "status": "✅ Success",
+                "voucher": result.get('giftVoucher'),
+                "user_id": device.user_id,
+                "device": f"{device.brand} {device.model}"
+            })
+        else:
+            print(f"\n❌ Failed: {result.get('message')}")
+            results.append({
+                "phone": phone,
+                "status": f"❌ Failed: {result.get('message', 'Unknown error')}",
+                "user_id": device.user_id,
+                "device": f"{device.brand} {device.model}"
+            })
+        
+        device.check_vouchers()
     
     print("\n" + "="*60)
     print("📊 SUMMARY")
