@@ -195,6 +195,7 @@ class LenskartFakeDevice:
         today_midnight_ist = (now_ist_ms // DAY_MS) * DAY_MS
         today_midnight_utc = today_midnight_ist - ist_offset_ms
         
+        # Use 0 steps for previous days, target steps for today
         step_counts = [0, 0, 0, 0, 0, 0, steps]
         
         payload = []
@@ -209,10 +210,23 @@ class LenskartFakeDevice:
 
     def claim_reward(self, steps: int = 30000):
         try:
+            # Build the correct payload structure
             body = self.build_steps_payload(steps)
+            
+            # Important: Use the correct endpoint with proper params
             params = {"campaignName": "run-for-frame"}
             
+            # Try with body as array
             r = self.post("/v2/customers/bff/campaign/eligibility", body, params)
+            
+            # If 400, try alternative payload structure
+            if r.status_code == 400:
+                # Some APIs expect a different format
+                alt_body = {
+                    "stepsData": body,
+                    "campaignName": "run-for-frame"
+                }
+                r = self.post("/v2/customers/bff/campaign/eligibility", alt_body, params)
             
             try:
                 data = r.json()
@@ -222,7 +236,6 @@ class LenskartFakeDevice:
             if r.status_code == 200:
                 res = data.get("result") or {}
                 if res.get("giftVoucher"):
-                    # Save reward to file
                     filename = f"reward_{self.phone}.json"
                     with open(filename, "w") as f:
                         json.dump(data, f, indent=2)
@@ -232,18 +245,21 @@ class LenskartFakeDevice:
                         "giftVoucher": res.get("giftVoucher"),
                         "steps": res.get("steps"),
                         "expiry": res.get("giftVoucherExpiryDate"),
-                        "message": res.get("message", "Reward claimed successfully!")
+                        "message": res.get("message", "Reward claimed successfully!"),
+                        "raw": data
                     }
                 else:
                     return {
                         "success": False,
                         "message": res.get("message", "No reward available"),
-                        "code": r.status_code
+                        "code": r.status_code,
+                        "raw": data
                     }
             else:
                 return {
                     "success": False,
-                    "message": f"API Error: {r.status_code}",
+                    "message": f"API Error: {r.status_code} - {data.get('message', data.get('error', 'Unknown'))}",
+                    "code": r.status_code,
                     "response": data
                 }
         except Exception as e:
@@ -317,6 +333,7 @@ def main():
             })
         else:
             print(f"\n❌ Failed: {result.get('message')}")
+            print(f"   Response: {result.get('response', {})}")
             results.append({
                 "phone": phone,
                 "status": f"❌ Failed: {result.get('message', 'Unknown error')}",
