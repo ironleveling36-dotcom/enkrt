@@ -78,9 +78,17 @@ def init_db():
         )
     ''')
     
+    # Grant admin rights to ADMIN_IDS
+    for admin_id in ADMIN_IDS:
+        c.execute('''
+            INSERT OR REPLACE INTO users (user_id, username, is_admin, verified, joined_date)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (admin_id, "admin", 1, 1, datetime.now()))
+    
     conn.commit()
     conn.close()
-    logger.info("Database initialized at: " + DB_PATH)
+    logger.info(f"Database initialized at: {DB_PATH}")
+    logger.info(f"Admins: {ADMIN_IDS}")
 
 def get_user(user_id):
     conn = sqlite3.connect(DB_PATH)
@@ -93,12 +101,18 @@ def get_user(user_id):
 def add_user(user_id, username, referral_code, referred_by=None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    
+    # Check if user is admin
+    is_admin = 1 if user_id in ADMIN_IDS else 0
+    verified = 1 if is_admin else 0  # Admins are automatically verified
+    
     c.execute('''
-        INSERT OR IGNORE INTO users (user_id, username, referral_code, referred_by, joined_date)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (user_id, username, referral_code, referred_by, datetime.now()))
+        INSERT OR IGNORE INTO users (user_id, username, referral_code, referred_by, joined_date, is_admin, verified)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, username, referral_code, referred_by, datetime.now(), is_admin, verified))
     conn.commit()
     conn.close()
+    return is_admin
 
 def update_user_phone(user_id, phone):
     conn = sqlite3.connect(DB_PATH)
@@ -135,10 +149,24 @@ def get_referrals(user_id):
 def get_all_users():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT user_id, username, phone, referal_count, verified FROM users ORDER BY joined_date DESC')
+    c.execute('SELECT user_id, username, phone, referal_count, verified, is_admin, is_banned FROM users ORDER BY joined_date DESC')
     users = c.fetchall()
     conn.close()
     return users
+
+def get_all_referrals():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        SELECT r.id, r.referrer_id, u1.username as referrer, r.referred_id, u2.username as referred, r.timestamp, r.status
+        FROM referrals r
+        LEFT JOIN users u1 ON r.referrer_id = u1.user_id
+        LEFT JOIN users u2 ON r.referred_id = u2.user_id
+        ORDER BY r.timestamp DESC
+    ''')
+    referrals = c.fetchall()
+    conn.close()
+    return referrals
 
 def log_action(user_id, action, details=""):
     conn = sqlite3.connect(DB_PATH)
@@ -164,8 +192,17 @@ def get_statistics():
     total = c.execute('SELECT COUNT(*) FROM users').fetchone()[0]
     verified = c.execute('SELECT COUNT(*) FROM users WHERE verified = 1').fetchone()[0]
     total_refs = c.execute('SELECT SUM(referal_count) FROM users').fetchone()[0] or 0
+    admins = c.execute('SELECT COUNT(*) FROM users WHERE is_admin = 1').fetchone()[0]
     conn.close()
-    return {'total': total, 'verified': verified, 'referrals': total_refs}
+    return {'total': total, 'verified': verified, 'referrals': total_refs, 'admins': admins}
+
+def delete_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
+    c.execute('DELETE FROM referrals WHERE referrer_id = ? OR referred_id = ?', (user_id, user_id))
+    conn.commit()
+    conn.close()
 
 # ============ LENSKART ============
 try:
@@ -220,9 +257,9 @@ def get_user_status(user_id):
         'referred_by': user[4],
         'referal_count': user[5],
         'joined_date': user[6],
-        'is_admin': user[7],
-        'is_banned': user[8],
-        'verified': user[9]
+        'is_admin': bool(user[7]),
+        'is_banned': bool(user[8]),
+        'verified': bool(user[9])
     }
 
 def get_bot_username():
@@ -243,6 +280,7 @@ def start_command(message):
         bot.send_message(user_id, "🚫 You are banned.")
         return
     
+    # Parse referral parameter
     ref_code = None
     if len(message.text.split()) > 1:
         ref_code = message.text.split()[1]
@@ -258,22 +296,22 @@ def start_command(message):
             if result:
                 referred_by = result[0]
         
-        add_user(user_id, username, generate_referral_code(), referred_by)
+        is_admin_user = add_user(user_id, username, generate_referral_code(), referred_by)
         
-        if referred_by:
+        if referred_by and not is_admin_user:
             add_referral(referred_by, user_id)
             increment_referrals(referred_by)
             try:
-                # Get referrer's username for notification
                 referrer = get_user(referred_by)
                 if referrer:
-                    bot.send_message(referred_by, f"🎯 New referral! @{username or 'User'} joined using your link.")
+                    bot.send_message(referred_by, f"🎯 New referral! @{username or 'User'} joined.")
             except:
                 pass
         
-        log_action(user_id, "start", f"Referred by: {referred_by}")
+        log_action(user_id, "start", f"Referred by: {referred_by}, Admin: {is_admin_user}")
     
-    if CHANNEL_ID and not check_channel_membership(user_id):
+    # Channel check (skip for admins)
+    if not is_admin(user_id) and CHANNEL_ID and not check_channel_membership(user_id):
         markup = InlineKeyboardMarkup()
         channel_username = CHANNEL_ID.replace('-100', '')
         markup.add(InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel_username}"))
@@ -294,13 +332,16 @@ def show_main_menu(user_id):
         return
     
     referrals = get_referrals(user_id)
-    verified = user['verified']
+    verified = user['verified'] or user['is_admin']  # Admin = verified
     bot_username = get_bot_username()
     link = f"https://t.me/{bot_username}?start={user['referral_code']}"
+    
+    admin_badge = "👑 Admin" if user['is_admin'] else ""
     
     text = f"""
 🎯 **Lenskart Frame Generator**
 
+{admin_badge}
 👤 User: @{user['username'] if user['username'] and not user['username'].isdigit() else 'User'}
 📱 Phone: {user['phone'] or 'Not set'}
 🔑 Code: `{user['referral_code']}`
@@ -322,7 +363,7 @@ def show_main_menu(user_id):
     else:
         markup.add(InlineKeyboardButton("🏃 Start Generation", callback_data="start_gen"))
     if is_admin(user_id):
-        markup.add(InlineKeyboardButton("⚙️ Admin", callback_data="admin_panel"))
+        markup.add(InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel"))
     
     bot.send_message(user_id, text, reply_markup=markup, parse_mode='Markdown')
 
@@ -333,7 +374,8 @@ def handle_callbacks(call):
     user_id = call.from_user.id
     data = call.data
     
-    if data != "check_membership" and CHANNEL_ID and not check_channel_membership(user_id):
+    # Skip channel check for admins
+    if not is_admin(user_id) and data != "check_membership" and CHANNEL_ID and not check_channel_membership(user_id):
         markup = InlineKeyboardMarkup()
         channel_username = CHANNEL_ID.replace('-100', '')
         markup.add(InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel_username}"))
@@ -374,7 +416,6 @@ def handle_callbacks(call):
         text = f"👥 **Your Referrals: {referrals}**\n\n"
         if ref_list:
             for i, (ref_user_id, ref_username, ts) in enumerate(ref_list, 1):
-                # Try to get the actual username from Telegram if stored username is numeric
                 display_name = ""
                 if ref_username and not ref_username.isdigit():
                     display_name = f"@{ref_username}"
@@ -419,6 +460,15 @@ def handle_callbacks(call):
         user = get_user_status(user_id)
         referrals = get_referrals(user_id)
         
+        # Admin bypass
+        if user['is_admin']:
+            bot.edit_message_text("👑 **Admin Access** - You're already verified!",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown')
+            show_main_menu(user_id)
+            return
+        
         if referrals >= 2 and not user['verified']:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
@@ -442,7 +492,7 @@ def handle_callbacks(call):
     
     elif data == "start_gen":
         user = get_user_status(user_id)
-        if not user['verified']:
+        if not user['verified'] and not user['is_admin']:
             bot.answer_callback_query(call.id, "❌ Need 2 referrals!")
             return
         start_generation_flow(user_id)
@@ -455,6 +505,13 @@ def handle_callbacks(call):
     
     elif data == "back_to_menu":
         show_main_menu(user_id)
+    
+    # Admin panel callbacks
+    elif data.startswith("admin_"):
+        if not is_admin(user_id):
+            bot.answer_callback_query(call.id, "⛔ Admin only!")
+            return
+        handle_admin_actions(call)
 
 # ============ GENERATION FLOW ============
 
@@ -560,27 +617,45 @@ def process_otp_input(message):
     otp_sessions.pop(user_id, None)
     show_main_menu(user_id)
 
-# ============ ADMIN ============
+# ============ ADMIN PANEL ============
 
 def show_admin_panel(message, admin_id):
     stats = get_statistics()
     text = f"""
 ⚙️ **Admin Panel**
 
-📊 Users: {stats['total']}
-✅ Verified: {stats['verified']}
-🔗 Referrals: {stats['referrals']}
+📊 **Statistics:**
+• Total Users: {stats['total']}
+• Verified Users: {stats['verified']}
+• Total Referrals: {stats['referrals']}
+• Admins: {stats['admins']}
+
+📌 **Admin Commands:**
+• /users - List all users
+• /referrals - View all referrals
+• /logs - View recent logs
+• /stats - View statistics
+• /broadcast <msg> - Send broadcast
+• /ban <user_id> - Ban user
+• /unban <user_id> - Unban user
+• /delete <user_id> - Delete user
+• /export - Export all data
 """
+    
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("📋 Users", callback_data="admin_list_users"),
-        InlineKeyboardButton("📜 Logs", callback_data="admin_view_logs"),
+        InlineKeyboardButton("📋 Users", callback_data="admin_users"),
+        InlineKeyboardButton("🔗 Referrals", callback_data="admin_referrals"),
+        InlineKeyboardButton("📜 Logs", callback_data="admin_logs"),
+        InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
         InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
         InlineKeyboardButton("🚫 Ban", callback_data="admin_ban"),
         InlineKeyboardButton("🔓 Unban", callback_data="admin_unban"),
-        InlineKeyboardButton("📊 Export", callback_data="admin_export")
+        InlineKeyboardButton("🗑️ Delete", callback_data="admin_delete"),
+        InlineKeyboardButton("📊 Export", callback_data="admin_export"),
+        InlineKeyboardButton("🔄 Reset All", callback_data="admin_reset")
     )
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="back_to_menu"))
+    markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu"))
     
     if isinstance(message, telebot.types.Message):
         bot.send_message(admin_id, text, reply_markup=markup, parse_mode='Markdown')
@@ -591,170 +666,245 @@ def show_admin_panel(message, admin_id):
             reply_markup=markup,
             parse_mode='Markdown')
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
-def admin_callback(call):
+def handle_admin_actions(call):
     user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔ Admin only!")
-        return
-    
     action = call.data.replace("admin_", "")
     
-    if action == "list_users":
+    if action == "users":
         users = get_all_users()
-        text = "📋 **Users:**\n\n"
-        for u in users[:20]:
+        text = "📋 **All Users:**\n\n"
+        for u in users[:30]:
             display_name = f"@{u[1]}" if u[1] and not u[1].isdigit() else f"ID: {u[0]}"
-            text += f"{display_name} | Ref: {u[3]} | {'✅' if u[4] else '❌'}\n"
-        if len(users) > 20:
-            text += f"\n... and {len(users)-20} more"
+            admin_tag = " 👑" if u[5] else ""
+            banned_tag = " 🚫" if u[6] else ""
+            text += f"{display_name}{admin_tag}{banned_tag} | Ref: {u[3]} | {'✅' if u[4] else '❌'}\n"
+        if len(users) > 30:
+            text += f"\n... and {len(users)-30} more"
         bot.edit_message_text(text,
             chat_id=call.message.chat.id,
             message_id=call.message.message_id,
             parse_mode='Markdown')
     
-    elif action == "view_logs":
-        logs = get_logs(20)
-        text = "📜 **Recent Logs:**\n\n"
-        for log in logs:
-            text += f"{log[4][:16]} | {log[1]} | {log[2]}\n"
+    elif action == "referrals":
+        refs = get_all_referrals()
+        text = "🔗 **All Referrals:**\n\n"
+        if refs:
+            for r in refs[:30]:
+                text += f"ID: {r[1]} → {r[3]} | {r[5][:16]}\n"
+            if len(refs) > 30:
+                text += f"\n... and {len(refs)-30} more"
+        else:
+            text += "No referrals yet."
         bot.edit_message_text(text,
             chat_id=call.message.chat.id,
             message_id=call.message.message_id)
     
+    elif action == "logs":
+        logs = get_logs(30)
+        text = "📜 **Recent Logs:**\n\n"
+        for log in logs:
+            text += f"{log[4][:16]} | {log[1]} | {log[2][:30]}\n"
+        bot.edit_message_text(text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id)
+    
+    elif action == "stats":
+        stats = get_statistics()
+        text = f"""
+📊 **Detailed Statistics:**
+
+👥 Total Users: {stats['total']}
+✅ Verified Users: {stats['verified']}
+🔗 Total Referrals: {stats['referrals']}
+👑 Admins: {stats['admins']}
+📱 Pending OTPs: {len(otp_sessions)}
+
+📈 **Referral Progress:**
+• Average referrals per user: {stats['referrals'] / max(stats['total'], 1):.2f}
+• Verification rate: {(stats['verified'] / max(stats['total'], 1) * 100):.1f}%
+"""
+        bot.edit_message_text(text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown')
+    
     elif action == "broadcast":
-        bot.send_message(user_id, "📢 Enter message:")
+        bot.send_message(user_id, "📢 Enter broadcast message:")
         bot.register_next_step_handler(call.message, process_broadcast)
         bot.answer_callback_query(call.id)
     
     elif action == "ban":
-        bot.send_message(user_id, "🚫 Enter user ID:")
+        bot.send_message(user_id, "🚫 Enter user ID to ban:")
         bot.register_next_step_handler(call.message, process_ban_user)
         bot.answer_callback_query(call.id)
     
     elif action == "unban":
-        bot.send_message(user_id, "🔓 Enter user ID:")
+        bot.send_message(user_id, "🔓 Enter user ID to unban:")
         bot.register_next_step_handler(call.message, process_unban_user)
+        bot.answer_callback_query(call.id)
+    
+    elif action == "delete":
+        bot.send_message(user_id, "🗑️ Enter user ID to delete:")
+        bot.register_next_step_handler(call.message, process_delete_user)
         bot.answer_callback_query(call.id)
     
     elif action == "export":
         data = {
             'users': get_all_users(),
+            'referrals': get_all_referrals(),
             'stats': get_statistics(),
-            'logs': get_logs(100)
+            'logs': get_logs(100),
+            'exported_at': datetime.now().isoformat()
         }
         with open('export_data.json', 'w') as f:
             json.dump(data, f, default=str, indent=2)
-        bot.send_message(user_id, "📊 Exported to `export_data.json`", parse_mode='Markdown')
-
-def process_broadcast(message):
-    admin_id = message.from_user.id
-    text = message.text
+        bot.send_message(user_id, "📊 Data exported to `export_data.json`", parse_mode='Markdown')
+        bot.answer_callback_query(call.id)
     
+    elif action == "reset":
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("⚠️ CONFIRM RESET", callback_data="admin_confirm_reset"),
+            InlineKeyboardButton("❌ Cancel", callback_data="back_to_menu")
+        )
+        bot.edit_message_text(
+            "⚠️ **WARNING: This will DELETE ALL DATA!**\n"
+            "This action cannot be undone.\n\n"
+            "Click CONFIRM RESET to proceed.",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=markup,
+            parse_mode='Markdown'
+        )
+    
+    elif action == "confirm_reset":
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('DELETE FROM users WHERE is_admin = 0')
+        c.execute('DELETE FROM referrals')
+        c.execute('DELETE FROM logs')
+        conn.commit()
+        conn.close()
+        log_action(user_id, "reset", "All data reset")
+        bot.edit_message_text("🔄 **All data has been reset!**",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown')
+        show_admin_panel(call.message, user_id)
+
+# ============ ADMIN COMMAND HANDLERS ============
+
+@bot.message_handler(commands=['users'])
+def cmd_users(message):
+    if not is_admin(message.from_user.id):
+        return
+    users = get_all_users()
+    text = "📋 Users:\n\n"
+    for u in users[:20]:
+        text += f"ID: {u[0]} | @{u[1] or 'N/A'} | {'👑' if u[5] else ''}\n"
+    bot.send_message(message.chat.id, text)
+
+@bot.message_handler(commands=['referrals'])
+def cmd_referrals(message):
+    if not is_admin(message.from_user.id):
+        return
+    refs = get_all_referrals()
+    text = "🔗 All Referrals:\n\n"
+    for r in refs[:20]:
+        text += f"{r[1]} → {r[3]} | {r[5][:16]}\n"
+    bot.send_message(message.chat.id, text)
+
+@bot.message_handler(commands=['logs'])
+def cmd_logs(message):
+    if not is_admin(message.from_user.id):
+        return
+    logs = get_logs(20)
+    text = "📜 Logs:\n\n"
+    for log in logs:
+        text += f"{log[4][:16]} | {log[1]} | {log[2]}\n"
+    bot.send_message(message.chat.id, text)
+
+@bot.message_handler(commands=['stats'])
+def cmd_stats(message):
+    if not is_admin(message.from_user.id):
+        return
+    stats = get_statistics()
+    text = f"📊 Users: {stats['total']}\n✅ Verified: {stats['verified']}\n🔗 Referrals: {stats['referrals']}"
+    bot.send_message(message.chat.id, text)
+
+@bot.message_handler(commands=['broadcast'])
+def cmd_broadcast(message):
+    if not is_admin(message.from_user.id):
+        return
+    msg = message.text.replace('/broadcast', '').strip()
+    if not msg:
+        bot.send_message(message.chat.id, "Usage: /broadcast <message>")
+        return
     users = get_all_users()
     sent = 0
-    for user in users:
+    for u in users:
         try:
-            bot.send_message(user[0], f"📢 {text}")
+            bot.send_message(u[0], f"📢 {msg}")
             sent += 1
             time.sleep(0.05)
         except:
             pass
-    
-    bot.send_message(admin_id, f"✅ Sent to {sent} users.")
-    log_action(admin_id, "broadcast", f"Sent to {sent}")
+    bot.send_message(message.chat.id, f"✅ Sent to {sent} users.")
 
-def process_ban_user(message):
-    admin_id = message.from_user.id
+@bot.message_handler(commands=['ban'])
+def cmd_ban(message):
+    if not is_admin(message.from_user.id):
+        return
     try:
-        user_id = int(message.text.strip())
+        user_id = int(message.text.replace('/ban', '').strip())
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('UPDATE users SET is_banned = 1 WHERE user_id = ?', (user_id,))
         conn.commit()
         conn.close()
-        log_action(admin_id, "banned", f"User {user_id}")
-        bot.send_message(admin_id, f"✅ User {user_id} banned.")
+        log_action(message.from_user.id, "banned", f"User {user_id}")
+        bot.send_message(message.chat.id, f"✅ User {user_id} banned.")
     except:
-        bot.send_message(admin_id, "❌ Invalid ID.")
+        bot.send_message(message.chat.id, "❌ Usage: /ban <user_id>")
 
-def process_unban_user(message):
-    admin_id = message.from_user.id
+@bot.message_handler(commands=['unban'])
+def cmd_unban(message):
+    if not is_admin(message.from_user.id):
+        return
     try:
-        user_id = int(message.text.strip())
+        user_id = int(message.text.replace('/unban', '').strip())
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('UPDATE users SET is_banned = 0 WHERE user_id = ?', (user_id,))
         conn.commit()
         conn.close()
-        log_action(admin_id, "unbanned", f"User {user_id}")
-        bot.send_message(admin_id, f"✅ User {user_id} unbanned.")
+        log_action(message.from_user.id, "unbanned", f"User {user_id}")
+        bot.send_message(message.chat.id, f"✅ User {user_id} unbanned.")
     except:
-        bot.send_message(admin_id, "❌ Invalid ID.")
+        bot.send_message(message.chat.id, "❌ Usage: /unban <user_id>")
 
-# ============ FLASK WEBHOOK SERVER ============
-
-from flask import Flask, request, jsonify
-
-app = Flask(__name__)
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
+@bot.message_handler(commands=['delete'])
+def cmd_delete(message):
+    if not is_admin(message.from_user.id):
+        return
     try:
-        json_str = request.get_data().decode('UTF-8')
-        update = telebot.types.Update.de_json(json_str)
-        bot.process_new_updates([update])
-        return 'OK', 200
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return 'Error', 500
+        user_id = int(message.text.replace('/delete', '').strip())
+        delete_user(user_id)
+        log_action(message.from_user.id, "deleted", f"User {user_id}")
+        bot.send_message(message.chat.id, f"✅ User {user_id} deleted.")
+    except:
+        bot.send_message(message.chat.id, "❌ Usage: /delete <user_id>")
 
-@app.route('/health')
-def health():
-    try:
-        stats = get_statistics()
-        return jsonify({
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "users": stats['total'],
-            "verified": stats['verified']
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
-
-@app.route('/')
-def index():
-    return "🦾 Lenskart Bot is running!"
-
-# ============ MAIN ============
-
-if __name__ == "__main__":
-    init_db()
-    logger.info("Bot starting...")
-    
-    # Remove old webhook
-    try:
-        bot.remove_webhook()
-        logger.info("Webhook removed")
-    except Exception as e:
-        logger.error(f"Webhook removal error: {e}")
-    
-    # Set webhook for production
-    if "RENDER" in os.environ:
-        webhook_url = f"{RENDER_URL}/webhook"
-        try:
-            result = bot.set_webhook(url=webhook_url)
-            if result:
-                logger.info(f"✅ Webhook set: {webhook_url}")
-            else:
-                logger.error("❌ Webhook set failed")
-        except Exception as e:
-            logger.error(f"Webhook error: {e}")
-        
-        port = int(os.environ.get("PORT", 5000))
-        logger.info(f"Starting Flask on port {port}")
-        app.run(host='0.0.0.0', port=port)
-    else:
-        # Local polling mode
-        logger.info("Starting polling mode")
-        bot.polling(none_stop=True, interval=0)
+@bot.message_handler(commands=['export'])
+def cmd_export(message):
+    if not is_admin(message.from_user.id):
+        return
+    data = {
+        'users': get_all_users(),
+        'referrals': get_all_referrals(),
+        'stats': get_statistics(),
+        'logs': get_logs(100)
+    }
+    with open('export_data.json', 'w') as f:
+        json.dump(data, f, default=str, indent=2)
+    bot.send_message(message.chat.id, "📊 Data exported to `export_data.json`",
