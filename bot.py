@@ -151,7 +151,7 @@ def get_referrals(user_id):
 def get_all_users():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT user_id, username, phone, referal_count, verified, is_admin, is_banned FROM users ORDER BY joined_date DESC')
+    c.execute('SELECT user_id, username, phone, referal_count, verified, is_admin FROM users ORDER BY joined_date DESC')
     users = c.fetchall()
     conn.close()
     return users
@@ -184,14 +184,6 @@ def get_statistics():
     conn.close()
     return {'total': total, 'verified': verified, 'referrals': total_refs, 'admins': admins}
 
-def delete_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
-    c.execute('DELETE FROM referrals WHERE referrer_id = ? OR referred_id = ?', (user_id, user_id))
-    conn.commit()
-    conn.close()
-
 def get_referral_requirement():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -206,20 +198,6 @@ def set_referral_requirement(value):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('referral_required', str(value)))
-    conn.commit()
-    conn.close()
-
-def ban_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE users SET is_banned = 1 WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
-
-def unban_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('UPDATE users SET is_banned = 0 WHERE user_id = ?', (user_id,))
     conn.commit()
     conn.close()
 
@@ -238,13 +216,11 @@ def unverify_user(user_id):
     conn.close()
 
 # ============ LENSKART ============
-# Import the original script directly
 try:
     from lenskart import LenskartFakeDevice
     logger.info("Lenskart module imported successfully!")
 except ImportError as e:
     logger.error(f"Lenskart module not found: {e}")
-    # Fallback dummy class
     class LenskartFakeDevice:
         def __init__(self, phone, phone_code="+91"):
             self.phone = phone
@@ -262,7 +238,6 @@ except ImportError as e:
         def me(self):
             return {"id": "123"}
         def claim_reward(self, steps=30000):
-            # Return the same format as the original script
             return {"giftVoucher": "TEST-123", "tier": "Gold", "steps": 30000}
 
 # ============ BOT ============
@@ -661,7 +636,6 @@ def process_otp_input(message):
     bot.send_message(user_id, "🏃 Claiming reward with 30,000 steps...")
     reward = device.claim_reward(steps=30000)
     
-    # Check if reward was successful (matches original script's return format)
     if reward and reward.get('giftVoucher'):
         voucher = reward.get('giftVoucher')
         tier = reward.get('tier', 'N/A')
@@ -679,7 +653,6 @@ def process_otp_input(message):
         )
         log_action(user_id, "reward_claimed", f"Voucher: {voucher}")
     else:
-        # Check if reward returned a message
         if reward and reward.get('message'):
             error_msg = reward.get('message')
         else:
@@ -721,9 +694,7 @@ def show_admin_panel(message, admin_id):
 • Set referral requirement (1, 2, 3, or 0 to OFF)
 • View all users
 • View logs
-• Ban/Unban users
 • Manually verify/unverify users
-• Broadcast messages
 • Reset all data
 """
     
@@ -732,11 +703,8 @@ def show_admin_panel(message, admin_id):
         InlineKeyboardButton("🎯 Set Referral Req", callback_data="admin_set_req"),
         InlineKeyboardButton("📋 Users", callback_data="admin_users"),
         InlineKeyboardButton("📜 Logs", callback_data="admin_logs"),
-        InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban"),
-        InlineKeyboardButton("🔓 Unban User", callback_data="admin_unban"),
         InlineKeyboardButton("✅ Verify User", callback_data="admin_verify"),
         InlineKeyboardButton("❌ Unverify User", callback_data="admin_unverify"),
-        InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
         InlineKeyboardButton("🔄 Reset All", callback_data="admin_reset")
     )
     markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu"))
@@ -760,8 +728,7 @@ def handle_admin_actions(call):
         for u in users[:30]:
             display_name = f"@{u[1]}" if u[1] and not u[1].isdigit() else f"ID: {u[0]}"
             admin_tag = " 👑" if u[5] else ""
-            banned_tag = " 🚫" if u[6] else ""
-            text += f"{display_name}{admin_tag}{banned_tag} | Ref: {u[3]} | {'✅' if u[4] else '❌'}\n"
+            text += f"{display_name}{admin_tag} | Ref: {u[3]} | {'✅' if u[4] else '❌'}\n"
         if len(users) > 30:
             text += f"\n... and {len(users)-30} more"
         bot.edit_message_text(text,
@@ -818,16 +785,6 @@ def handle_admin_actions(call):
         show_admin_panel(call.message, user_id)
         bot.answer_callback_query(call.id)
     
-    elif action == "ban":
-        bot.send_message(user_id, "🚫 Enter user ID to ban:")
-        bot.register_next_step_handler(call.message, process_ban_user)
-        bot.answer_callback_query(call.id)
-    
-    elif action == "unban":
-        bot.send_message(user_id, "🔓 Enter user ID to unban:")
-        bot.register_next_step_handler(call.message, process_unban_user)
-        bot.answer_callback_query(call.id)
-    
     elif action == "verify":
         bot.send_message(user_id, "✅ Enter user ID to verify:")
         bot.register_next_step_handler(call.message, process_verify_user)
@@ -836,11 +793,6 @@ def handle_admin_actions(call):
     elif action == "unverify":
         bot.send_message(user_id, "❌ Enter user ID to unverify:")
         bot.register_next_step_handler(call.message, process_unverify_user)
-        bot.answer_callback_query(call.id)
-    
-    elif action == "broadcast":
-        bot.send_message(user_id, "📢 Enter broadcast message:")
-        bot.register_next_step_handler(call.message, process_broadcast)
         bot.answer_callback_query(call.id)
     
     elif action == "reset":
@@ -876,26 +828,6 @@ def handle_admin_actions(call):
 
 # ============ ADMIN HELPER FUNCTIONS ============
 
-def process_ban_user(message):
-    admin_id = message.from_user.id
-    try:
-        user_id = int(message.text.strip())
-        ban_user(user_id)
-        log_action(admin_id, "banned", f"User {user_id}")
-        bot.send_message(admin_id, f"✅ User {user_id} banned.")
-    except:
-        bot.send_message(admin_id, "❌ Invalid user ID.")
-
-def process_unban_user(message):
-    admin_id = message.from_user.id
-    try:
-        user_id = int(message.text.strip())
-        unban_user(user_id)
-        log_action(admin_id, "unbanned", f"User {user_id}")
-        bot.send_message(admin_id, f"✅ User {user_id} unbanned.")
-    except:
-        bot.send_message(admin_id, "❌ Invalid user ID.")
-
 def process_verify_user(message):
     admin_id = message.from_user.id
     try:
@@ -903,8 +835,8 @@ def process_verify_user(message):
         verify_user(user_id)
         log_action(admin_id, "verified", f"Manually verified {user_id}")
         bot.send_message(admin_id, f"✅ User {user_id} verified.")
-    except:
-        bot.send_message(admin_id, "❌ Invalid user ID.")
+    except Exception as e:
+        bot.send_message(admin_id, f"❌ Error: {str(e)}")
 
 def process_unverify_user(message):
     admin_id = message.from_user.id
@@ -913,16 +845,75 @@ def process_unverify_user(message):
         unverify_user(user_id)
         log_action(admin_id, "unverified", f"Manually unverified {user_id}")
         bot.send_message(admin_id, f"❌ User {user_id} unverified.")
-    except:
-        bot.send_message(admin_id, "❌ Invalid user ID.")
+    except Exception as e:
+        bot.send_message(admin_id, f"❌ Error: {str(e)}")
 
-def process_broadcast(message):
-    admin_id = message.from_user.id
-    broadcast_text = message.text
+# ============ FLASK WEBHOOK ============
+
+try:
+    from flask import Flask, request, jsonify
+except ImportError:
+    logger.error("Flask not installed!")
+    sys.exit(1)
+
+app = Flask(__name__)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        json_str = request.get_data().decode('UTF-8')
+        update = telebot.types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+        return 'OK', 200
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return 'Error', 500
+
+@app.route('/health')
+def health():
+    try:
+        stats = get_statistics()
+        req = get_referral_requirement()
+        return jsonify({
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "users": stats['total'],
+            "verified": stats['verified'],
+            "referral_requirement": req
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route('/')
+def index():
+    return "🦾 Lenskart Bot is running!"
+
+# ============ MAIN ============
+
+if __name__ == "__main__":
+    init_db()
+    logger.info("Bot starting...")
     
-    users = get_all_users()
-    sent = 0
-    for user in users:
+    try:
+        bot.remove_webhook()
+        logger.info("Webhook removed")
+    except Exception as e:
+        logger.error(f"Webhook removal error: {e}")
+    
+    if "RENDER" in os.environ:
+        webhook_url = f"{RENDER_URL}/webhook"
         try:
-            bot.send_message(user[0], f"📢 {broadcast_text}")
-            sent += 1
+            result = bot.set_webhook(url=webhook_url)
+            if result:
+                logger.info(f"✅ Webhook set: {webhook_url}")
+            else:
+                logger.error("❌ Webhook set failed")
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+        
+        port = int(os.environ.get("PORT", 5000))
+        logger.info(f"Starting Flask on port {port}")
+        app.run(host='0.0.0.0', port=port)
+    else:
+        logger.info("Starting polling mode")
+        bot.polling(none_stop=True, interval=0)
