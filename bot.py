@@ -938,4 +938,12 @@ def health():
             "users": stats['total'],
             "verified": stats['verified'],
             "referral_requirement": req
-       
+        })
+    except Exception as e:
+        logger.error(f"Health error: {e}")
+        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+
+if __name__ == '__main__':
+    init_db()
+    port = int(os.getenv('PORT', '10000'))
+    app.run(host='0.0.0.0', port=port)
