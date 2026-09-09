@@ -238,25 +238,31 @@ def unverify_user(user_id):
     conn.close()
 
 # ============ LENSKART ============
+# Import the original script directly
 try:
     from lenskart import LenskartFakeDevice
-except ImportError:
-    logger.warning("Lenskart module not found, using dummy")
+    logger.info("Lenskart module imported successfully!")
+except ImportError as e:
+    logger.error(f"Lenskart module not found: {e}")
+    # Fallback dummy class
     class LenskartFakeDevice:
         def __init__(self, phone, phone_code="+91"):
             self.phone = phone
             self.brand = "test"
             self.model = "test"
             self.udid = "test123"
+            self.user_id = None
         def create_session(self):
             return True
         def send_otp(self):
             return {"isNewUser": True}
         def verify_otp(self, code):
+            self.user_id = "123"
             return {"token": "test_token", "user_id": "123"}
         def me(self):
             return {"id": "123"}
         def claim_reward(self, steps=30000):
+            # Return the same format as the original script
             return {"giftVoucher": "TEST-123", "tier": "Gold", "steps": 30000}
 
 # ============ BOT ============
@@ -600,13 +606,14 @@ def process_phone_input(message):
         
         bot.send_message(user_id, "🔄 Creating session...")
         if not device.create_session():
-            bot.send_message(user_id, "❌ Session failed.")
+            bot.send_message(user_id, "❌ Session creation failed.")
             show_main_menu(user_id)
             return
         
         bot.send_message(user_id, "📨 Sending OTP...")
-        if not device.send_otp():
-            bot.send_message(user_id, "❌ OTP send failed.")
+        otp_result = device.send_otp()
+        if not otp_result:
+            bot.send_message(user_id, "❌ OTP send failed. Check phone number.")
             show_main_menu(user_id)
             return
         
@@ -641,7 +648,8 @@ def process_otp_input(message):
         return
     
     bot.send_message(user_id, "🔄 Verifying OTP...")
-    if not device.verify_otp(otp):
+    verify_result = device.verify_otp(otp)
+    if not verify_result:
         bot.send_message(user_id, "❌ Wrong OTP. Try again.")
         otp_sessions.pop(user_id, None)
         show_main_menu(user_id)
@@ -650,24 +658,43 @@ def process_otp_input(message):
     bot.send_message(user_id, "🔄 Getting profile...")
     device.me()
     
-    bot.send_message(user_id, "🏃 Claiming reward...")
+    bot.send_message(user_id, "🏃 Claiming reward with 30,000 steps...")
     reward = device.claim_reward(steps=30000)
     
+    # Check if reward was successful (matches original script's return format)
     if reward and reward.get('giftVoucher'):
+        voucher = reward.get('giftVoucher')
+        tier = reward.get('tier', 'N/A')
+        steps = reward.get('steps', 30000)
+        
         bot.send_message(
             user_id,
-            f"🎉 **SUCCESS!**\n\n"
-            f"🏆 Tier: {reward.get('tier')}\n"
-            f"🎫 Voucher: {reward.get('giftVoucher')}\n"
-            f"📊 Steps: {reward.get('steps')}\n"
-            f"📱 Device: {device.brand} {device.model}",
+            f"🎉 **REWARD CLAIMED!**\n\n"
+            f"🏆 Tier: {tier}\n"
+            f"🎫 Voucher: `{voucher}`\n"
+            f"📊 Steps: {steps}\n"
+            f"📱 Device: {device.brand} {device.model}\n\n"
+            f"✅ Reward saved to reward_{device.phone}.json",
             parse_mode='Markdown'
         )
-        log_action(user_id, "reward_claimed", f"Voucher: {reward.get('giftVoucher')}")
+        log_action(user_id, "reward_claimed", f"Voucher: {voucher}")
     else:
-        msg = reward.get('message', 'No reward') if reward else 'Failed'
-        bot.send_message(user_id, f"⚠️ {msg}")
-        log_action(user_id, "reward_failed", msg)
+        # Check if reward returned a message
+        if reward and reward.get('message'):
+            error_msg = reward.get('message')
+        else:
+            error_msg = "No reward available or already claimed"
+        
+        bot.send_message(
+            user_id,
+            f"⚠️ **Reward Claim Failed**\n\n"
+            f"Reason: {error_msg}\n\n"
+            f"📱 Device: {device.brand} {device.model}\n"
+            f"🆔 UDID: {device.udid[:8]}...\n\n"
+            f"Try again with a different phone number.",
+            parse_mode='Markdown'
+        )
+        log_action(user_id, "reward_failed", error_msg)
     
     otp_sessions.pop(user_id, None)
     show_main_menu(user_id)
@@ -899,51 +926,3 @@ def process_broadcast(message):
         try:
             bot.send_message(user[0], f"📢 {broadcast_text}")
             sent += 1
-            time.sleep(0.05)
-        except:
-            pass
-    
-    bot.send_message(admin_id, f"✅ Broadcast sent to {sent} users.")
-    log_action(admin_id, "broadcast", f"Sent to {sent} users")
-
-# ============ FLASK WEBHOOK ============
-
-try:
-    from flask import Flask, request, jsonify
-except ImportError:
-    logger.error("Flask not installed!")
-    sys.exit(1)
-
-app = Flask(__name__)
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    try:
-        json_str = request.get_data().decode('UTF-8')
-        update = telebot.types.Update.de_json(json_str)
-        bot.process_new_updates([update])
-        return 'OK', 200
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return 'Error', 500
-
-@app.route('/health')
-def health():
-    try:
-        stats = get_statistics()
-        req = get_referral_requirement()
-        return jsonify({
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "users": stats['total'],
-            "verified": stats['verified'],
-            "referral_requirement": req
-        })
-    except Exception as e:
-        logger.error(f"Health error: {e}")
-        return jsonify({"status": "unhealthy", "error": str(e)}), 500
-
-if __name__ == '__main__':
-    init_db()
-    port = int(os.getenv('PORT', '10000'))
-    app.run(host='0.0.0.0', port=port)
