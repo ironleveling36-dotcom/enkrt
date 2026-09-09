@@ -1,24 +1,69 @@
 import os
+import sys
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import random
 import string
-import threading
 import time
 import logging
 from datetime import datetime
 import sqlite3
 import json
-
-from config import BOT_TOKEN, CHANNEL_ID, ADMIN_IDS, RENDER_URL
-import database as db
-from lenskart import LenskartFakeDevice
+import requests
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# Import config
+try:
+    from config import BOT_TOKEN, CHANNEL_ID, ADMIN_IDS, RENDER_URL
+except ImportError:
+    logger.error("Config file not found! Creating default config.")
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+    CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+    ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
+    RENDER_URL = os.getenv("RENDER_URL", "https://enkrt.onrender.com")
+
+# Import database
+try:
+    import database as db
+except ImportError:
+    logger.error("Database module not found!")
+    sys.exit(1)
+
+# Import Lenskart
+try:
+    from lenskart import LenskartFakeDevice
+except ImportError as e:
+    logger.error(f"Lenskart module not found: {e}")
+    # Create dummy class if missing
+    class LenskartFakeDevice:
+        def __init__(self, phone, phone_code="+91"):
+            self.phone = phone
+            self.brand = "test"
+            self.model = "test"
+        def create_session(self): return True
+        def send_otp(self): return True
+        def verify_otp(self, code): return True
+        def me(self): return {}
+        def claim_reward(self, steps=30000): return {"giftVoucher": "TEST-123"}
+
+# Validate BOT_TOKEN
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN not set! Please set it in environment variables.")
+    sys.exit(1)
+
+# Initialize bot
+try:
+    bot = telebot.TeleBot(BOT_TOKEN)
+    logger.info("Bot initialized successfully!")
+except Exception as e:
+    logger.error(f"Failed to initialize bot: {e}")
+    sys.exit(1)
 
 # Store active OTP sessions
 otp_sessions = {}
@@ -32,10 +77,13 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 def check_channel_membership(user_id):
+    if not CHANNEL_ID:
+        return True  # Skip if no channel set
     try:
         member = bot.get_chat_member(CHANNEL_ID, user_id)
         return member.status in ['member', 'administrator', 'creator']
-    except:
+    except Exception as e:
+        logger.error(f"Channel check error: {e}")
         return False
 
 def get_user_status(user_id):
@@ -79,68 +127,74 @@ def start_command(message):
     user_id = message.from_user.id
     username = message.from_user.username or str(user_id)
     
-    # Check if user is banned
-    user = db.get_user(user_id)
-    if user and user[8] == 1:
-        bot.send_message(user_id, "🚫 You are banned from using this bot.")
-        return
-    
-    # Parse referral parameter
-    ref_code = None
-    if len(message.text.split()) > 1:
-        ref_code = message.text.split()[1]
-    
-    # Add user to DB if new
-    if not user:
-        referred_by = None
-        if ref_code:
-            conn = sqlite3.connect(db.DB_PATH)
-            c = conn.cursor()
-            c.execute('SELECT user_id FROM users WHERE referral_code = ?', (ref_code,))
-            result = c.fetchone()
-            conn.close()
-            if result:
-                referred_by = result[0]
+    try:
+        # Check if user is banned
+        user = db.get_user(user_id)
+        if user and user[8] == 1:
+            bot.send_message(user_id, "🚫 You are banned from using this bot.")
+            return
         
-        db.add_user(user_id, username, generate_referral_code(), referred_by)
+        # Parse referral parameter
+        ref_code = None
+        if len(message.text.split()) > 1:
+            ref_code = message.text.split()[1]
         
-        if referred_by:
-            db.add_referral(referred_by, user_id)
-            db.increment_referrals(referred_by)
-            try:
-                bot.send_message(referred_by, f"🎯 New referral! {username} joined using your link.")
-            except:
-                pass
+        # Add user to DB if new
+        if not user:
+            referred_by = None
+            if ref_code:
+                conn = sqlite3.connect(db.DB_PATH)
+                c = conn.cursor()
+                c.execute('SELECT user_id FROM users WHERE referral_code = ?', (ref_code,))
+                result = c.fetchone()
+                conn.close()
+                if result:
+                    referred_by = result[0]
+            
+            db.add_user(user_id, username, generate_referral_code(), referred_by)
+            
+            if referred_by:
+                db.add_referral(referred_by, user_id)
+                db.increment_referrals(referred_by)
+                try:
+                    bot.send_message(referred_by, f"🎯 New referral! {username} joined using your link.")
+                except:
+                    pass
+            
+            db.log_action(user_id, "start", f"Referred by: {referred_by}")
         
-        db.log_action(user_id, "start", f"Referred by: {referred_by}")
-    
-    # Check channel membership
-    if not check_channel_membership(user_id):
-        markup = InlineKeyboardMarkup()
-        channel_username = CHANNEL_ID.replace('-100', '')
-        markup.add(InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel_username}"))
-        markup.add(InlineKeyboardButton("🔄 Check Again", callback_data="check_membership"))
-        bot.send_message(
-            user_id,
-            "🚫 You must join our channel to use this bot!\n\n"
-            "Click the button below to join, then click 'Check Again'.",
-            reply_markup=markup
-        )
-        return
-    
-    # Main menu
-    show_main_menu(user_id)
+        # Check channel membership
+        if CHANNEL_ID and not check_channel_membership(user_id):
+            markup = InlineKeyboardMarkup()
+            channel_username = CHANNEL_ID.replace('-100', '')
+            markup.add(InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel_username}"))
+            markup.add(InlineKeyboardButton("🔄 Check Again", callback_data="check_membership"))
+            bot.send_message(
+                user_id,
+                "🚫 You must join our channel to use this bot!\n\n"
+                "Click the button below to join, then click 'Check Again'.",
+                reply_markup=markup
+            )
+            return
+        
+        # Main menu
+        show_main_menu(user_id)
+        
+    except Exception as e:
+        logger.error(f"Start command error: {e}")
+        bot.send_message(user_id, f"❌ Error: {str(e)}")
 
 def show_main_menu(user_id):
-    user = get_user_status(user_id)
-    if not user:
-        # Recreate user
-        return
-    
-    referrals = db.get_referrals(user_id)
-    verified = user['verified']
-    
-    text = f"""
+    try:
+        user = get_user_status(user_id)
+        if not user:
+            bot.send_message(user_id, "❌ User not found. Please use /start again.")
+            return
+        
+        referrals = db.get_referrals(user_id)
+        verified = user['verified']
+        
+        text = f"""
 🎯 **Lenskart Frame Generator**
 
 👤 User: {user['username']}
@@ -152,20 +206,24 @@ def show_main_menu(user_id):
 **Status:** {'🔓 Active' if verified else '🔒 Locked'}
 Need 2 referrals to unlock!
 """
-    
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("📋 My Referrals", callback_data="my_referrals"),
-        InlineKeyboardButton("🔗 Referral Link", callback_data="get_link")
-    )
-    if not verified:
-        markup.add(InlineKeyboardButton("🔓 Check Status", callback_data="check_status"))
-    else:
-        markup.add(InlineKeyboardButton("🏃 Start Generation", callback_data="start_gen"))
-    if is_admin(user_id):
-        markup.add(InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel"))
-    
-    bot.send_message(user_id, text, reply_markup=markup, parse_mode='Markdown')
+        
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📋 My Referrals", callback_data="my_referrals"),
+            InlineKeyboardButton("🔗 Referral Link", callback_data="get_link")
+        )
+        if not verified:
+            markup.add(InlineKeyboardButton("🔓 Check Status", callback_data="check_status"))
+        else:
+            markup.add(InlineKeyboardButton("🏃 Start Generation", callback_data="start_gen"))
+        if is_admin(user_id):
+            markup.add(InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel"))
+        
+        bot.send_message(user_id, text, reply_markup=markup, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Show main menu error: {e}")
+        bot.send_message(user_id, f"❌ Error: {str(e)}")
 
 # ============ Callback Handlers ============
 
@@ -174,130 +232,135 @@ def handle_callbacks(call):
     user_id = call.from_user.id
     data = call.data
     
-    # Check channel membership first (except for membership check itself)
-    if data != "check_membership" and not check_channel_membership(user_id):
-        markup = InlineKeyboardMarkup()
-        channel_username = CHANNEL_ID.replace('-100', '')
-        markup.add(InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel_username}"))
-        markup.add(InlineKeyboardButton("🔄 Check Again", callback_data="check_membership"))
-        bot.edit_message_text(
-            "🚫 You must join our channel first!",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            reply_markup=markup
-        )
-        return
-    
-    if data == "check_membership":
-        if check_channel_membership(user_id):
+    try:
+        # Check channel membership first (except for membership check itself)
+        if data != "check_membership" and CHANNEL_ID and not check_channel_membership(user_id):
+            markup = InlineKeyboardMarkup()
+            channel_username = CHANNEL_ID.replace('-100', '')
+            markup.add(InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel_username}"))
+            markup.add(InlineKeyboardButton("🔄 Check Again", callback_data="check_membership"))
             bot.edit_message_text(
-                "✅ You're a member! Redirecting...",
+                "🚫 You must join our channel first!",
                 chat_id=call.message.chat.id,
-                message_id=call.message.message_id
+                message_id=call.message.message_id,
+                reply_markup=markup
             )
-            show_main_menu(user_id)
-        else:
-            bot.answer_callback_query(call.id, "❌ Still not a member. Please join first!")
-    
-    elif data == "my_referrals":
-        referrals = db.get_referrals(user_id)
-        user = get_user_status(user_id)
+            return
         
-        conn = sqlite3.connect(db.DB_PATH)
-        c = conn.cursor()
-        c.execute('''
-            SELECT u.username, r.timestamp 
-            FROM referrals r
-            JOIN users u ON r.referred_id = u.user_id
-            WHERE r.referrer_id = ?
-            ORDER BY r.timestamp DESC
-        ''', (user_id,))
-        ref_list = c.fetchall()
-        conn.close()
+        if data == "check_membership":
+            if check_channel_membership(user_id):
+                bot.edit_message_text(
+                    "✅ You're a member! Redirecting...",
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id
+                )
+                show_main_menu(user_id)
+            else:
+                bot.answer_callback_query(call.id, "❌ Still not a member. Please join first!")
         
-        text = f"👥 **Your Referrals: {referrals}**\n\n"
-        if ref_list:
-            for i, (username, ts) in enumerate(ref_list, 1):
-                text += f"{i}. @{username or 'Unknown'} - {ts[:16]}\n"
-        else:
-            text += "No referrals yet. Share your link!"
-        
-        text += f"\n🔑 Code: `{user['referral_code']}`\n"
-        text += f"Need 2 referrals to unlock: {referrals}/2"
-        
-        bot.edit_message_text(
-            text,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode='Markdown'
-        )
-    
-    elif data == "get_link":
-        user = get_user_status(user_id)
-        link = get_referral_link(user_id, call.from_user.username)
-        if link:
-            text = f"🔗 **Your Referral Link:**\n`{link}`\n\nShare this link with friends. After 2 join, you unlock!"
-        else:
-            text = "❌ Error generating link. Please contact admin."
-        bot.edit_message_text(
-            text,
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            parse_mode='Markdown'
-        )
-    
-    elif data == "check_status":
-        user = get_user_status(user_id)
-        referrals = db.get_referrals(user_id)
-        
-        if referrals >= 2 and not user['verified']:
+        elif data == "my_referrals":
+            referrals = db.get_referrals(user_id)
+            user = get_user_status(user_id)
+            
             conn = sqlite3.connect(db.DB_PATH)
             c = conn.cursor()
-            c.execute('UPDATE users SET verified = 1 WHERE user_id = ?', (user_id,))
-            conn.commit()
+            c.execute('''
+                SELECT u.username, r.timestamp 
+                FROM referrals r
+                JOIN users u ON r.referred_id = u.user_id
+                WHERE r.referrer_id = ?
+                ORDER BY r.timestamp DESC
+            ''', (user_id,))
+            ref_list = c.fetchall()
             conn.close()
-            db.log_action(user_id, "verified", "Unlocked via referrals")
-            bot.edit_message_text(
-                "✅ **Congratulations!** You've been unlocked!\n\n"
-                "You can now use the Lenskart Frame Generator.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                parse_mode='Markdown'
-            )
-            show_main_menu(user_id)
-        else:
-            if user['verified']:
-                status = "🔓 **Unlocked**"
-                status_msg = "You're verified!"
+            
+            text = f"👥 **Your Referrals: {referrals}**\n\n"
+            if ref_list:
+                for i, (username, ts) in enumerate(ref_list, 1):
+                    text += f"{i}. @{username or 'Unknown'} - {ts[:16]}\n"
             else:
-                status = "🔒 **Locked**"
-                status_msg = "Keep sharing your link!"
+                text += "No referrals yet. Share your link!"
+            
+            text += f"\n🔑 Code: `{user['referral_code']}`\n"
+            text += f"Need 2 referrals to unlock: {referrals}/2"
             
             bot.edit_message_text(
-                f"📊 **Status:** {status}\n"
-                f"👥 Referrals: {referrals}/2\n\n"
-                f"{status_msg}",
+                text,
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
                 parse_mode='Markdown'
             )
-    
-    elif data == "start_gen":
-        user = get_user_status(user_id)
-        if not user['verified']:
-            bot.answer_callback_query(call.id, "❌ You need 2 referrals first!")
-            return
         
-        start_generation_flow(user_id)
-    
-    elif data == "admin_panel":
-        if not is_admin(user_id):
-            bot.answer_callback_query(call.id, "⛔ Admin only!")
-            return
-        show_admin_panel(call.message, user_id)
-    
-    elif data == "back_to_menu":
-        show_main_menu(user_id)
+        elif data == "get_link":
+            user = get_user_status(user_id)
+            link = get_referral_link(user_id, call.from_user.username)
+            if link:
+                text = f"🔗 **Your Referral Link:**\n`{link}`\n\nShare this link with friends. After 2 join, you unlock!"
+            else:
+                text = "❌ Error generating link. Please contact admin."
+            bot.edit_message_text(
+                text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown'
+            )
+        
+        elif data == "check_status":
+            user = get_user_status(user_id)
+            referrals = db.get_referrals(user_id)
+            
+            if referrals >= 2 and not user['verified']:
+                conn = sqlite3.connect(db.DB_PATH)
+                c = conn.cursor()
+                c.execute('UPDATE users SET verified = 1 WHERE user_id = ?', (user_id,))
+                conn.commit()
+                conn.close()
+                db.log_action(user_id, "verified", "Unlocked via referrals")
+                bot.edit_message_text(
+                    "✅ **Congratulations!** You've been unlocked!\n\n"
+                    "You can now use the Lenskart Frame Generator.",
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    parse_mode='Markdown'
+                )
+                show_main_menu(user_id)
+            else:
+                if user['verified']:
+                    status = "🔓 **Unlocked**"
+                    status_msg = "You're verified!"
+                else:
+                    status = "🔒 **Locked**"
+                    status_msg = "Keep sharing your link!"
+                
+                bot.edit_message_text(
+                    f"📊 **Status:** {status}\n"
+                    f"👥 Referrals: {referrals}/2\n\n"
+                    f"{status_msg}",
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    parse_mode='Markdown'
+                )
+        
+        elif data == "start_gen":
+            user = get_user_status(user_id)
+            if not user['verified']:
+                bot.answer_callback_query(call.id, "❌ You need 2 referrals first!")
+                return
+            
+            start_generation_flow(user_id)
+        
+        elif data == "admin_panel":
+            if not is_admin(user_id):
+                bot.answer_callback_query(call.id, "⛔ Admin only!")
+                return
+            show_admin_panel(call.message, user_id)
+        
+        elif data == "back_to_menu":
+            show_main_menu(user_id)
+            
+    except Exception as e:
+        logger.error(f"Callback error: {e}")
+        bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}")
 
 # ============ Generation Flow ============
 
@@ -563,40 +626,86 @@ def export_data():
     with open('export_data.json', 'w') as f:
         json.dump(data, f, default=str, indent=2)
 
-# ============ Start Bot ============
+# ============ Flask Webhook Server ============
+
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    try:
+        json_data = request.get_json()
+        update = telebot.types.Update.de_json(json_data)
+        bot.process_new_updates([update])
+        return 'OK', 200
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return 'Error', 500
+
+@app.route('/health')
+def health():
+    try:
+        stats = db.get_statistics()
+        return jsonify({
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "users": stats['total'],
+            "verified": stats['verified'],
+            "webhook": "active"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route('/')
+def index():
+    return "🦾 Lenskart Bot is running! Webhook is active."
+
+@app.route('/setwebhook')
+def set_webhook():
+    """Helper endpoint to set webhook"""
+    try:
+        url = f"{RENDER_URL}/webhook"
+        response = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+            params={"url": url}
+        )
+        return jsonify(response.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============ Start Server ============
 
 if __name__ == "__main__":
-    db.init_db()
-    logger.info("Bot started!")
-    
-    if "RENDER" in os.environ:
-        from flask import Flask, request, jsonify
+    try:
+        db.init_db()
+        logger.info("Database initialized successfully!")
         
-        app = Flask(__name__)
-        
-        @app.route("/webhook", methods=["POST"])
-        def webhook():
-            update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-            bot.process_new_updates([update])
-            return "OK", 200
-        
-        @app.route("/health")
-        def health():
-            stats = db.get_statistics()
-            return jsonify({
-                "status": "healthy",
-                "timestamp": datetime.now().isoformat(),
-                "users": stats['total'],
-                "verified": stats['verified']
-            })
-        
-        @app.route("/")
-        def index():
-            return "🦾 Lenskart Bot is running!"
+        # Remove existing webhook
+        try:
+            bot.remove_webhook()
+            logger.info("Webhook removed")
+        except Exception as e:
+            logger.error(f"Webhook removal error: {e}")
         
         port = int(os.environ.get("PORT", 5000))
-        app.run(host="0.0.0.0", port=port)
-    else:
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.polling(none_stop=True, interval=0)
+        logger.info(f"Starting Flask server on port {port}")
+        logger.info(f"Webhook URL: {RENDER_URL}/webhook")
+        logger.info(f"Health check: {RENDER_URL}/health")
+        
+        # Auto-set webhook
+        try:
+            webhook_url = f"{RENDER_URL}/webhook"
+            result = bot.set_webhook(url=webhook_url)
+            if result:
+                logger.info(f"✅ Webhook set to: {webhook_url}")
+            else:
+                logger.error("❌ Failed to set webhook")
+        except Exception as e:
+            logger.error(f"Webhook set error: {e}")
+        
+        app.run(host='0.0.0.0', port=port)
+        
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
+        sys.exit(1)
